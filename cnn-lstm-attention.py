@@ -5,15 +5,14 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, balanced_accuracy_score, cohen_kappa_score,confusion_matrix, f1_score
-
 import matplotlib.pyplot as plt
 import pywt
 from tqdm import tqdm
+import pre_data.loadedf_shhs
 import pre_data.loadedf_78
 import pre_data.loadedf
 from imblearn.metrics import geometric_mean_score
 
-# 自定义数据预处理模块 ------------------------------------------------------
 class EEGPreprocessor:
     def __init__(self, train_mean=None, train_std=None):
         self.train_mean = train_mean
@@ -32,7 +31,6 @@ class EEGPreprocessor:
             self.train_std = np.std(X, axis=(0, 1)) + eps
         return (X - self.train_mean) / self.train_std
 
-
 # 增强型数据集类 -----------------------------------------------------------
 class EEGDataset(Dataset):
     def __init__(self, X, y, preprocessor=None, augment=False):
@@ -44,39 +42,35 @@ class EEGDataset(Dataset):
     def __len__(self):
         return len(self.X)
 
-
     def __getitem__(self, idx):
-        signal = self.X[idx]
-
-        # 小波去噪
-        denoised = np.stack([self.preprocessor.wavelet_denoise(ch) for ch in signal.T], axis=1)
+        signal = self.X[idx]  # 已预处理和标准化的数据
 
         # 数据增强
         if self.augment:
             # 随机时间偏移
             shift = np.random.randint(-100, 100)
-            denoised = np.roll(denoised, shift, axis=0)
+            signal = np.roll(signal, shift, axis=0)
             # 添加高斯噪声
-            noise = np.random.normal(0, 0.05, denoised.shape)
-            denoised = denoised + noise
+            noise = np.random.normal(0, 0.05, signal.shape)
+            signal = signal + noise
 
         # 返回信号和标签
-        return torch.FloatTensor(denoised), torch.LongTensor([self.y[idx]]).squeeze()  # 确保标签为标量
-
+        return torch.FloatTensor(signal), torch.LongTensor([self.y[idx]]).squeeze()  # 确保标签为标量
 
 class EEGHybridModel(nn.Module):
     def __init__(self):
         super().__init__()
         # CNN特征提取
         self.cnn = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=15, stride=3),
+            nn.Conv1d(2, 32, kernel_size=15, stride=3),
             nn.BatchNorm1d(32),
             nn.GELU(),
             nn.MaxPool1d(3),
-            nn.Conv1d(32, 64, kernel_size=7),
+            nn.Conv1d(32, 64, kernel_size=15),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.MaxPool1d(3)
+            nn.MaxPool1d(3),
+            nn.Dropout(0.3)
         )
 
         # LSTM
@@ -88,6 +82,7 @@ class EEGHybridModel(nn.Module):
             dropout=0.6,
             batch_first=True
         )
+        self.lstm_norm = nn.LayerNorm(128)
 
         # 注意力机制（输入维度改为 128）
         self.attention = nn.Sequential(
@@ -132,7 +127,7 @@ class EEGHybridModel(nn.Module):
 
         # LSTM处理
         lstm_out, _ = self.lstm(x)  # [batch, seq, 128]
-
+        lstm_out = self.lstm_norm(lstm_out)
         # 注意力机制
         attn_weights = self.attention(lstm_out)  # [batch, seq, 1]
         context = torch.sum(attn_weights * lstm_out, dim=1)  # [batch, 128]
@@ -153,17 +148,30 @@ class Trainer:
             X, y,
             test_size=0.05,
             stratify=y,
-            random_state=42  # 添加可重复性种子
+            random_state=42  # 可重复性种子
         )
 
-        # 步骤2：仅用训练数据计算标准化参数
-        self.preprocessor = EEGPreprocessor()  # 新建预处理器实例
-        X_train_norm = self.preprocessor.normalize(X_train)  # 关键修改：仅训练数据参与计算
+        # 步骤2：对原始数据进行小波去噪
+        temp_preprocessor = EEGPreprocessor()
+        # 处理训练集
+        X_train_denoised = np.array([
+            np.stack([temp_preprocessor.wavelet_denoise(ch) for ch in sample.T], axis=1)
+            for sample in X_train
+        ])
+        # 处理验证集
+        X_val_denoised = np.array([
+            np.stack([temp_preprocessor.wavelet_denoise(ch) for ch in sample.T], axis=1)
+            for sample in X_val
+        ])
 
-        # 步骤3：验证集使用训练数据参数标准化
-        X_val_norm = (X_val - self.preprocessor.train_mean) / self.preprocessor.train_std
+        # 步骤3：用去噪后的训练数据计算标准化参数
+        self.preprocessor = EEGPreprocessor()
+        X_train_norm = self.preprocessor.normalize(X_train_denoised)  # 计算并应用标准化
 
-        # 步骤4：创建数据集
+        # 步骤4：验证集使用训练参数标准化
+        X_val_norm = (X_val_denoised - self.preprocessor.train_mean) / self.preprocessor.train_std
+
+        # 步骤5：创建数据集
         train_dataset = EEGDataset(X_train_norm, y_train, self.preprocessor, augment=True)
         val_dataset = EEGDataset(X_val_norm, y_val, self.preprocessor, augment=False)
 
@@ -271,8 +279,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # # 加载数据 (假设已实现text.load_all_edf_and_crop)
-    # data_dir = "C:/Users/moufamiao/Desktop/sleep/data/20"
+    # # 加载数据
     X, y = pre_data.loadedf.loaddata()
     X = np.transpose(X, (0, 2, 1))
 
@@ -287,13 +294,13 @@ if __name__ == "__main__":
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=1,
+        num_workers=0,
         pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        num_workers=1,
+        num_workers=0,
         pin_memory=True
     )
 
