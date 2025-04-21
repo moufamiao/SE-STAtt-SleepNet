@@ -66,7 +66,7 @@ class EEGHybridModel(nn.Module):
             nn.BatchNorm1d(32),
             nn.GELU(),
             nn.MaxPool1d(3),
-            nn.Conv1d(32, 64, kernel_size=15),
+            nn.Conv1d(32, 64, kernel_size=7),
             nn.BatchNorm1d(64),
             nn.GELU(),
             nn.MaxPool1d(3),
