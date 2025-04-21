@@ -62,7 +62,7 @@ class EEGHybridModel(nn.Module):
         super().__init__()
         # CNN特征提取
         self.cnn = nn.Sequential(
-            nn.Conv1d(2, 32, kernel_size=15, stride=3),
+            nn.Conv1d(1, 32, kernel_size=15, stride=3),
             nn.BatchNorm1d(32),
             nn.GELU(),
             nn.MaxPool1d(3),
